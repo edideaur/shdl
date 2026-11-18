@@ -1,0 +1,6 @@
+# Downloads default to ./; keep only the standalone client files.
+/*
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/site_dl.py
