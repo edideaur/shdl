@@ -4,8 +4,10 @@
 import argparse
 from collections import deque
 from contextlib import contextmanager
+from copy import copy
 import fcntl
 import hashlib
+from http.cookiejar import MozillaCookieJar
 import json
 import os
 from pathlib import Path
@@ -19,7 +21,7 @@ import tempfile
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
+from urllib.request import HTTPCookieProcessor, HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 try:
     from websockets.exceptions import ConnectionClosed, InvalidHandshake
@@ -109,7 +111,10 @@ class Client:
         self.session = ""
         self.pow_token = ""
         self.pow_expiry = 0
-        self.opener = build_opener(HTTPSHandler(context=context), SameOriginRedirect(self.base_url))
+        # Preserve the server's bucket cookie across separate connections.
+        self.cookies = MozillaCookieJar()
+        self.opener = build_opener(HTTPSHandler(context=context), HTTPCookieProcessor(self.cookies),
+                                   SameOriginRedirect(self.base_url))
 
     def request(self, path, payload=None, protected=False, method=None):
         method = method or ("POST" if payload is not None else "GET")
@@ -129,6 +134,9 @@ class Client:
             except HTTPError as exc:
                 response = exc
             except (URLError, OSError) as exc:
+                reason = exc.reason if isinstance(exc, URLError) else exc
+                if isinstance(reason, ssl.SSLCertVerificationError):
+                    raise Error("TLS certificate verification failed; use a trusted --ca-certificate or explicitly use --insecure") from exc
                 # A timed-out POST may already have created a queue entry. Don't replay it blindly.
                 raise Error(f"{method} API request failed; no automatic replay") from exc
             try:
@@ -187,8 +195,12 @@ class Client:
     def socket(self, qid):
         scheme = "wss" if self.base_url.startswith("https://") else "ws"
         url = f"{scheme}://{urlsplit(self.base_url).netloc}/ws?" + urlencode({"queue_id": qid, "session": self.session})
+        request = Request(self.base_url + "/ws")
+        self.cookies.add_cookie_header(request)
+        cookie = request.get_header("Cookie")
         return connect(url, ssl=self.context if scheme == "wss" else None,
-                       origin=self.base_url, compression=None, open_timeout=20,
+                       origin=self.base_url, additional_headers={"Cookie": opaque(cookie, "cookie header")} if cookie else None,
+                       compression=None, open_timeout=20,
                        close_timeout=5, max_size=65536)
 
     def cancel(self, qid):
@@ -381,10 +393,28 @@ def aria2_download(client, ws, url, path, size, insecure=False, ca_certificate=N
     # Use stdin, not argv or a saved manifest, so bearer URLs don't appear in ps or files.
     manifest = f"{url}\n  dir={path.parent}\n  out={path.name}\n"
     try:
-        process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
+        export_cookies = MozillaCookieJar()
+        for cookie in client.cookies:
+            if cookie.is_expired():
+                continue
+            for value in (cookie.domain, cookie.path, cookie.name, cookie.value):
+                if value:
+                    opaque(value, "cookie field")
+            cookie = copy(cookie)
+            # aria2 requires expiry 0 for session cookies, not Python's empty field.
+            if cookie.expires is None:
+                cookie.expires = 0
+            export_cookies.set_cookie(cookie)
+        # Inherit an anonymous cookie file; aria2 applies domain/path rules, including on redirects.
+        with tempfile.TemporaryFile(dir=path.parent) as cookie_file:
+            cookie_path = f"/proc/self/fd/{cookie_file.fileno()}"
+            export_cookies.save(cookie_path, ignore_discard=True, ignore_expires=True)
+            args.append("--load-cookies=" + cookie_path)
+            process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                       pass_fds=(cookie_file.fileno(),))
     except OSError as exc:
-        raise Error("Could not start aria2c") from exc
+        raise Error("Could not prepare aria2 cookies or start aria2c (requires Linux /proc/self/fd)") from exc
     monitor, last_progress = True, 0
     try:
         process.stdin.write(manifest)

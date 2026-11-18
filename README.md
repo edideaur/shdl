@@ -8,7 +8,8 @@ or files you are authorized to retrieve.
 ## Install on the NAS
 
 Requires **Python 3.10+**, **aria2c**, and a destination filesystem supporting
-Linux advisory file locks. Tested with Python 3.14, websockets 16.0, and aria2 1.37.
+Linux advisory file locks. Linux `/proc/self/fd` must be available for the cookie
+handoff to aria2. Tested with Python 3.14, websockets 16.0, and aria2 1.37.
 Install Python and aria2 using your NAS's package manager, then copy this folder
 onto the NAS and run:
 
@@ -51,6 +52,9 @@ Downloading a certificate from the unverified connection does not establish trus
   with matching metadata and size. Keep `.aria2` control files and `.site-dl-state.json`.
 - Uses one transfer and one connection at a time, respecting the site's queue.
   It obtains links just before download rather than saving expiring URLs.
+- Retains the server's routing cookies across API, WebSocket, and aria2 requests.
+  aria2 loads them from a private, anonymous temporary file; cookies aren't put
+  in process arguments or left in the download directory.
 - Retries expired turns, transient queue responses, and failed transfers up to
   three times. Does not blindly replay an API POST after a transport failure.
 - Ctrl+C gracefully stops aria2 and attempts to cancel the queue turn. Exit
@@ -60,9 +64,9 @@ Downloading a certificate from the unverified connection does not establish trus
   use a fresh destination rather than discarding existing data.
 - A per-directory lock prevents two clients writing the same collection. Don't
   run a separate aria2 instance against the same destination files.
-- Tokens remain in memory; download URLs go to aria2 over stdin, not process
-  arguments or saved manifests. aria2 output is suppressed to avoid leaking
-  URLs; queue/progress/completion information is displayed by the client.
+- Proof-of-work and download tokens remain in memory; download URLs go to aria2
+  over stdin, not process arguments or saved manifests. aria2 output is suppressed
+  to avoid leaking URLs; queue/progress/completion information is displayed by the client.
 - Completion checks metadata, size, and aria2's exit status. The API provides no
   checksums, so this isn't cryptographic content verification. The catalog is a
   startup snapshot, not continuous synchronization.
